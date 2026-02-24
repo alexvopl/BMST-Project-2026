@@ -130,10 +130,10 @@ with col_rebalance:
     
     weights_data = {
         "Asset": ['S&P500', 'GLD', 'TLT', 'VNQ'],
-        "Current Weight": [0.30, 0.20, 0.30, 0.10],
-        "Target Weight": [0.25, 0.15, 0.40, 0.15] if risk_profile == "Conservative" else 
-                         [0.40, 0.30, 0.20, 0.05] if risk_profile == "Aggressive" else
-                         [0.35, 0.25, 0.25, 0.05]
+        "Current Weight": [0.40, 0.20, 0.30, 0.10],
+        "Target Weight": [0.30, 0.15, 0.40, 0.15] if risk_profile == "Conservative" else 
+                         [0.50, 0.20, 0.20, 0.10] if risk_profile == "Aggressive" else
+                         [0.40, 0.20, 0.30, 0.10]
     }
     
     df_weights = pd.DataFrame(weights_data)
