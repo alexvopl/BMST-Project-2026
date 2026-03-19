@@ -4,6 +4,28 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import time
+import os
+from transformers import pipeline
+from datetime import datetime, timedelta
+import yfinance as yf
+from newsapi import NewsApiClient
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TICKERS = ['SPY', 'GLD', 'TLT', 'VNQ', 'USO']
+
+# Human-readable search queries for each ticker (better news results)
+TICKER_QUERIES = {
+    'SPY': 'S&P 500 stock market',
+    'GLD': 'Gold ETF commodity',
+    'TLT': 'US Treasury bonds TLT',
+    'VNQ': 'Real estate REIT VNQ',
+    'USO': 'crude oil USO ETF',
+}
+
+# AUTO-REFRESH every 60 seconds (60000 ms)
+# a remettre
 
 #  Page Config (Layout) 
 st.set_page_config(
@@ -17,15 +39,116 @@ st.title("AI & NSGA-II Driven Portfolio Digital Twin")
 st.markdown("### Real-Time Portfolio Management")
 st.markdown("---")
 
-# Fake Data Generation (a modif + tard quand on aura les vraies données)
-@st.cache_data(ttl=5)
-def simulate_market_data():
-    """Simulates real-time market data for a few ETFs."""
-    np.random.seed(int(time.time()))
-    assets = ['S&P500', 'GLD', 'TLT', 'VNQ']
-    dates = pd.date_range(end=pd.Timestamp.now(), periods=100, freq='D')
-    prices = pd.DataFrame(np.random.randn(100, len(assets)).cumsum(axis=0) + 100, columns=assets, index=dates)
+def load_market_data():
+    """
+    Fetches real daily closing prices from Yahoo Finance.
+    - Uses the last 6 months of data for charts
+    - Returns a clean DataFrame with Date as index
+    """
+    end = datetime.now()
+    start = end - timedelta(days=180)
+    
+    data = yf.download(
+        TICKERS,
+        start=start.strftime("%Y-%m-%d"),
+        end=end.strftime("%Y-%m-%d"),
+        interval="1d",
+        progress=False  # no progress bar in Streamlit
+    )
+    
+    # yfinance returns MultiIndex columns: (Price, Ticker)
+    # We only want closing prices
+    prices = data["Close"]
+    
+    # Drop rows with any NaN (weekends, holidays already excluded)
+    prices = prices.dropna()
     return prices
+ 
+ 
+@st.cache_data(ttl=60)
+def load_latest_prices():
+    """
+    Fetches the most recent intraday prices (last 1 day, 1-min interval).
+    This gives the 'live' feeling on the dashboard.
+    """
+    try:
+        data = yf.download(
+            TICKERS,
+            period="1d",
+            interval="1m",
+            progress=False
+        )
+        prices = data["Close"].dropna()
+        return prices
+    except Exception:
+        # Fallback: if intraday fails (market closed), return None
+        return None
+ 
+ 
+# Load data
+prices_df = load_market_data()
+intraday_df = load_latest_prices()
+ 
+# Compute daily returns for correlation matrix
+returns_df = prices_df.pct_change().dropna()
+ 
+# Latest prices (last row)
+latest_prices = prices_df.iloc[-1]
+ 
+# Rolling correlation matrix (60-day window)
+correlation_matrix = returns_df.tail(60).corr()
+
+# ── FinBERT: load once, reuse across re-runs ──────────────────────────────
+@st.cache_resource
+def load_finbert():
+    """Load ProsusAI/finbert once. Downloads ~500MB on first run."""
+    return pipeline(
+        "text-classification",
+        model="ProsusAI/finbert",
+        tokenizer="ProsusAI/finbert",
+    )
+
+
+@st.cache_data(ttl=600)  # cache news for 10 min to respect free-tier limits
+def fetch_news(ticker: str):
+    """Fetch the 5 most recent articles for a ticker via NewsAPI."""
+    api_key = os.getenv("NEWS_API_KEY", "")
+    if not api_key or api_key == "your_newsapi_key_here":
+        return []  # graceful no-op if key not configured
+    try:
+        newsapi = NewsApiClient(api_key=api_key)
+        query = TICKER_QUERIES.get(ticker, ticker)
+        response = newsapi.get_everything(
+            q=query,
+            language="en",
+            sort_by="publishedAt",
+            page_size=5,
+        )
+        articles = response.get("articles", [])
+        return [
+            {
+                "title": a.get("title", ""),
+                "description": a.get("description", "") or "",
+                "url": a.get("url", ""),
+                "published": a.get("publishedAt", "")[:10],  # YYYY-MM-DD
+                "source": a.get("source", {}).get("name", ""),
+            }
+            for a in articles
+            if a.get("title")
+        ]
+    except Exception as e:
+        return [{"title": f"Error fetching news: {e}", "description": "", "url": "", "published": "", "source": ""}]
+
+
+def analyze_sentiment(texts: list, finbert) -> list:
+    """Run FinBERT on a list of strings. Returns [{label, score}, ...]."""
+    if not texts:
+        return []
+    # Truncate to 512 chars – FinBERT's max token window
+    truncated = [t[:512] for t in texts]
+    results = finbert(truncated)
+    return results
+
 
 @st.cache_data(ttl=5)
 def simulate_pareto_front():
@@ -43,7 +166,7 @@ def simulate_ai_anomaly():
     return is_anomaly
 
 
-prices_df = simulate_market_data()
+prices_df = load_market_data()
 pareto_df = simulate_pareto_front()
 is_anomaly = simulate_ai_anomaly()
 
@@ -59,6 +182,26 @@ with st.sidebar:
         options=["Conservative", "Moderate", "Aggressive"],
         value="Moderate"
     )
+
+# -- LATEST PRICES METRICS --
+if len(prices_df) > 0:
+    st.subheader("Latest Asset Prices")
+    latest = prices_df.iloc[-1]
+    
+    if len(prices_df) > 1:
+        prev = prices_df.iloc[-2]
+    else:
+        prev = latest
+        
+    cols = st.columns(len(TICKERS))
+    for i, ticker in enumerate(TICKERS):
+        if ticker in latest:
+            current_price = latest[ticker]
+            prev_price = prev[ticker] if ticker in prev else current_price
+            delta = current_price - prev_price
+            cols[i].metric(label=ticker, value=f"${current_price:.2f}", delta=f"${delta:.2f}")
+
+st.markdown("---")
 
 # -- TOP SECTION : Market Monitor & Digital Twin Side-by-Side --
 col_market, col_twin = st.columns(2)
@@ -119,8 +262,8 @@ with col_ai:
         
     st.markdown("**Random Forest Return Predictions (Next 1M):**")
     pred_data = {
-        "Asset": ['S&P500', 'GLD', 'TLT', 'VNQ'], 
-        "Predicted Return": [f"{np.random.normal(0.01, 0.02)*100:.2f}%" for _ in range(4)]
+        "Asset": ['S&P500', 'GLD', 'TLT', 'VNQ', 'USO'], 
+        "Predicted Return": [f"{np.random.normal(0.01, 0.02)*100:.2f}%" for _ in range(5)]
     }
     st.dataframe(pd.DataFrame(pred_data), use_container_width=True)
 
@@ -129,11 +272,11 @@ with col_rebalance:
     st.markdown(f"**Current Status:** {'Needs Rebalancing' if is_anomaly or risk_profile != 'Moderate' else 'Optimal'}")
     
     weights_data = {
-        "Asset": ['S&P500', 'GLD', 'TLT', 'VNQ'],
-        "Current Weight": [0.40, 0.20, 0.30, 0.10],
-        "Target Weight": [0.30, 0.15, 0.40, 0.15] if risk_profile == "Conservative" else 
-                         [0.50, 0.20, 0.20, 0.10] if risk_profile == "Aggressive" else
-                         [0.40, 0.20, 0.30, 0.10]
+        "Asset": ['S&P500', 'GLD', 'TLT', 'VNQ', 'USO'],
+        "Current Weight": [0.35, 0.15, 0.25, 0.10, 0.15],
+        "Target Weight": [0.25, 0.15, 0.35, 0.15, 0.10] if risk_profile == "Conservative" else 
+                         [0.40, 0.20, 0.15, 0.10, 0.15] if risk_profile == "Aggressive" else
+                         [0.35, 0.15, 0.25, 0.10, 0.15]
     }
     
     df_weights = pd.DataFrame(weights_data)
@@ -147,3 +290,61 @@ with col_rebalance:
     
     if st.button("Execute Trades (Update Physical Twin)", use_container_width=True):
         st.success("Transactions sent via MQTT!")
+
+st.markdown("---")
+
+# ── NEWS & FINBERT SENTIMENT SECTION ──────────────────────────────────────
+st.subheader("📰 Financial News & FinBERT Sentiment")
+
+api_key_present = bool(os.getenv("NEWS_API_KEY", "")) and os.getenv("NEWS_API_KEY") != "your_newsapi_key_here"
+
+if not api_key_present:
+    st.warning(
+        "Problème de clef API (fichier venv verif)"
+    )
+else:
+    finbert = load_finbert()
+    tabs = st.tabs(TICKERS)
+
+    SENTIMENT_CONFIG = {
+        "positive": ("Positive", "success"),
+        "neutral":  ("Neutral",  "info"),
+        "negative": ("Negative", "error"),
+    }
+
+    for tab, ticker in zip(tabs, TICKERS):
+        with tab:
+            with st.spinner(f"Fetching news for {ticker}…"):
+                articles = fetch_news(ticker)
+
+            if not articles:
+                st.info("No articles found for this asset.")
+            else:
+                # Run FinBERT on all titles+descriptions in one batch
+                texts = [
+                    f"{a['title']}. {a['description']}" if a['description'] else a['title']
+                    for a in articles
+                ]
+                sentiments = analyze_sentiment(texts, finbert)
+
+                for i, article in enumerate(articles):
+                    sentiment = sentiments[i] if i < len(sentiments) else {"label": "neutral", "score": 0.0}
+                    label_raw = sentiment["label"].lower()
+                    score = sentiment["score"]
+                    label_text, badge_type = SENTIMENT_CONFIG.get(label_raw, ("Neutral", "info"))
+
+                    with st.container():
+                        col_text, col_badge = st.columns([5, 1])
+                        with col_text:
+                            st.markdown(
+                                f"**{article['title']}**  \n"
+                                f"<small>{article['published']} &nbsp;|&nbsp; {article['source']}</small>",
+                                unsafe_allow_html=True,
+                            )
+                            if article['description']:
+                                st.caption(article['description'][:200] + "…" if len(article['description']) > 200 else article['description'])
+                            if article['url']:
+                                st.markdown(f"[Read more ↗]({article['url']})")
+                        with col_badge:
+                            getattr(st, badge_type)(f"{label_text}  \n`{score:.0%}`")
+                    st.divider()
