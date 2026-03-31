@@ -43,6 +43,8 @@ st.session_state.setdefault("event_log", [])
 st.session_state.setdefault("refresh_count", 0)
 st.session_state.setdefault("last_nsga2_run", None)   # timestamp of last NSGA-II run
 st.session_state.setdefault("run_nsga2_now", False)   # set True by the manual button
+st.session_state.setdefault("sentiment_scores", None)     # cached after first FinBERT run
+st.session_state.setdefault("article_sentiments", None)   # cached after first FinBERT run
 
 # Increment refresh counter on every run
 st.session_state["refresh_count"] += 1
@@ -544,7 +546,8 @@ with st.sidebar:
     for i, ticker in enumerate(TICKERS):
         w = st.session_state.get("current_weights", np.ones(len(TICKERS)) / len(TICKERS))
         pct = w[i] * 100
-        st.progress(w[i], text=f"{ticker}: {pct:.1f}%")
+        safe_w = float(np.clip(w[i], 0.0, 1.0))
+        st.progress(safe_w, text=f"{ticker}: {pct:.1f}%")
 
 # ═════════════════════════════════════════════════════════════════════════════
 # MAIN FLOW — TASK 11: Wire everything together
@@ -554,41 +557,56 @@ with st.sidebar:
 prices_df  = load_market_data()
 returns_df = prices_df.pct_change().dropna()
 
-# ── Step 3: Load sentiment (NewsAPI + FinBERT) — results used in features ─────
-api_key_present = (
-    bool(os.getenv("NEWS_API_KEY", ""))
-    and os.getenv("NEWS_API_KEY") != "your_newsapi_key_here"
-)
-finbert = load_finbert() if api_key_present else None
-
 SENTIMENT_CONFIG = {
     "positive": ("Positive", "success"),
     "neutral":  ("Neutral",  "info"),
     "negative": ("Negative", "error"),
 }
 
-# Per-ticker average FinBERT score (used as feature + gauge)
-sentiment_scores   = {t: 0.0 for t in TICKERS}
-article_sentiments = {t: [] for t in TICKERS}  # for the news tab display
+api_key_present = (
+    bool(os.getenv("NEWS_API_KEY", ""))
+    and os.getenv("NEWS_API_KEY") != "your_newsapi_key_here"
+)
 
-if api_key_present and finbert is not None:
-    for ticker in TICKERS:
-        articles = fetch_news(ticker)
-        if articles:
-            texts = [
-                f"{a['title']}. {a['description']}" if a["description"] else a["title"]
-                for a in articles
-            ]
-            results = analyze_sentiment(texts, finbert)
-            article_sentiments[ticker] = list(zip(articles, results))
+# ── Step 3: Sentiment — loaded lazily into session state (runs only ONCE) ─────
+# Use cached values if already computed; otherwise default to neutral (0.0)
+# so the rest of the dashboard renders immediately without waiting for FinBERT.
+if st.session_state["sentiment_scores"] is None:
+    # First run or first refresh: use neutral defaults so the UI shows right away
+    sentiment_scores   = {t: 0.0 for t in TICKERS}
+    article_sentiments = {t: [] for t in TICKERS}
 
-            # Map positive→+score, negative→-score, neutral→0
-            scores = []
-            for r in results:
-                lbl = r["label"].lower()
-                s   = r["score"]
-                scores.append(s if lbl == "positive" else -s if lbl == "negative" else 0.0)
-            sentiment_scores[ticker] = float(np.mean(scores)) if scores else 0.0
+    if api_key_present:
+        # Load FinBERT + run sentiment in a background-style spinner
+        # This only blocks on the VERY FIRST run; subsequent runs use cache
+        with st.spinner("Loading FinBERT sentiment model (first run only)…"):
+            try:
+                finbert = load_finbert()
+                for ticker in TICKERS:
+                    articles = fetch_news(ticker)
+                    if articles:
+                        texts = [
+                            f"{a['title']}. {a['description']}" if a["description"] else a["title"]
+                            for a in articles
+                        ]
+                        results = analyze_sentiment(texts, finbert)
+                        article_sentiments[ticker] = list(zip(articles, results))
+                        scores = []
+                        for r in results:
+                            lbl = r["label"].lower()
+                            s   = r["score"]
+                            scores.append(s if lbl == "positive" else -s if lbl == "negative" else 0.0)
+                        sentiment_scores[ticker] = float(np.mean(scores)) if scores else 0.0
+            except Exception as e:
+                st.warning(f"Sentiment analysis unavailable: {e}")
+
+    # Only persist to session once fully computed
+    st.session_state["sentiment_scores"]   = sentiment_scores
+    st.session_state["article_sentiments"] = article_sentiments
+else:
+    # Subsequent runs: use cached values instantly (no FinBERT reload)
+    sentiment_scores   = st.session_state["sentiment_scores"]
+    article_sentiments = st.session_state["article_sentiments"]
 
 # ── Step 2: Compute features ──────────────────────────────────────────────────
 features_df = compute_features(prices_df, sentiment_scores)
@@ -631,7 +649,8 @@ else:
 if st.session_state.get("run_nsga2_now", False):
     st.session_state["run_nsga2_now"] = False  # reset flag immediately
     with st.spinner("Running NSGA-II optimisation…"):
-        pareto_df = run_nsga2(exp_ret_vec, cov_matrix)
+        # Reduced pop_size and n_gen for fast UI responsiveness (prevents auto-refresh timeout)
+        pareto_df = run_nsga2(exp_ret_vec, cov_matrix, pop_size=40, n_gen=50)
     st.session_state["pareto_front"]  = pareto_df
     st.session_state["last_nsga2_run"] = datetime.now()
     st.session_state["event_log"].append({
@@ -741,26 +760,36 @@ col_market, col_heatmap = st.columns(2)
 
 with col_market:
     st.subheader("Market Monitor")
-    fig_prices = px.line(
-        prices_df,
-        title="Asset Prices over Time",
-        labels={"value": "Price", "index": "Date"},
-    )
-    fig_prices.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
-    st.plotly_chart(fig_prices, use_container_width=True)
+    try:
+        fig_prices = px.line(
+            prices_df,
+            title="Asset Prices over Time",
+            labels={"value": "Price", "index": "Date"},
+        )
+        fig_prices.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_prices, use_container_width=True)
+    except Exception as e:
+        import traceback
+        st.error(f"Error drawing market monitor: {e}")
+        st.text(traceback.format_exc())
 
 with col_heatmap:
     st.subheader("60-Day Rolling Correlation")
-    corr_60 = returns_df.tail(60).corr()
-    fig_corr = px.imshow(
-        corr_60,
-        color_continuous_scale="RdBu_r",
-        zmin=-1, zmax=1,
-        text_auto=".2f",
-        title="60-Day Correlation Heatmap",
-    )
-    fig_corr.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
-    st.plotly_chart(fig_corr, use_container_width=True)
+    try:
+        corr_60 = returns_df.tail(60).corr()
+        fig_corr = px.imshow(
+            corr_60,
+            color_continuous_scale="RdBu_r",
+            zmin=-1, zmax=1,
+            text_auto=".2f",
+            title="60-Day Correlation Heatmap",
+        )
+        fig_corr.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+        st.plotly_chart(fig_corr, use_container_width=True)
+    except Exception as e:
+        import traceback
+        st.error(f"Error drawing heatmap: {e}")
+        st.text(traceback.format_exc())
 
 st.markdown("---")
 
@@ -788,33 +817,38 @@ st.markdown("---")
 
 # ── NSGA-II Pareto Front ──────────────────────────────────────────────────────
 st.subheader("NSGA-II Pareto Front")
-fig_pareto = px.scatter(
-    pareto_df, x="Risk", y="Expected Return",
-    title="Multi-Objective Optimisation (Pareto Front)",
-    hover_data=["w_SPY", "w_TLT", "w_GLD", "w_VNQ", "w_USO"],
-)
+try:
+    fig_pareto = px.scatter(
+        pareto_df, x="Risk", y="Expected Return",
+        title="Multi-Objective Optimisation (Pareto Front)",
+        hover_data=["w_SPY", "w_TLT", "w_GLD", "w_VNQ", "w_USO"],
+    )
 
-# Current portfolio (hardcoded baseline)
-daily_port_var = float(current_weights @ cov_matrix @ current_weights)
-daily_port_ret = float(exp_ret_vec @ current_weights)
-fig_pareto.add_trace(go.Scatter(
-    x=[np.sqrt(daily_port_var) * np.sqrt(252)],
-    y=[(1 + daily_port_ret) ** 252 - 1],
-    mode="markers",
-    marker=dict(color="red", size=15, symbol="star"),
-    name="Current Portfolio",
-))
+    # Current portfolio (hardcoded baseline)
+    daily_port_var = float(current_weights @ cov_matrix @ current_weights)
+    daily_port_ret = float(exp_ret_vec @ current_weights)
+    fig_pareto.add_trace(go.Scatter(
+        x=[np.sqrt(np.clip(daily_port_var, 0, None)) * np.sqrt(252)],
+        y=[(1 + daily_port_ret) ** 252 - 1],
+        mode="markers",
+        marker=dict(color="red", size=15, symbol="star"),
+        name="Current Portfolio",
+    ))
 
-# Target portfolio from risk profile
-fig_pareto.add_trace(go.Scatter(
-    x=[opt_row["Risk"]], y=[opt_row["Expected Return"]],
-    mode="markers",
-    marker=dict(color="lime", size=15, symbol="star"),
-    name=f"Optimal Target ({risk_profile})",
-))
+    # Target portfolio from risk profile
+    fig_pareto.add_trace(go.Scatter(
+        x=[opt_row["Risk"]], y=[opt_row["Expected Return"]],
+        mode="markers",
+        marker=dict(color="lime", size=15, symbol="star"),
+        name=f"Optimal Target ({risk_profile})",
+    ))
 
-fig_pareto.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
-st.plotly_chart(fig_pareto, use_container_width=True)
+    fig_pareto.update_layout(template="plotly_dark", margin=dict(l=0, r=0, t=30, b=0))
+    st.plotly_chart(fig_pareto, use_container_width=True)
+except Exception as e:
+    import traceback
+    st.error(f"Error drawing Pareto front: {e}")
+    st.text(traceback.format_exc())
 
 st.markdown("---")
 
@@ -850,12 +884,9 @@ with col_rebalance:
     df_weights["Delta"] = df_weights["Target Weight"] - df_weights["Current Weight"]
     df_weights["Delta"] = df_weights["Delta"].round(4)
 
-    def highlight_delta(val):
-        color = "#00FF00" if val > 0 else "#FF0000" if val < 0 else "white"
-        return f"color: {color}"
-
+    # Use native Streamlit column mapping, avoids PyArrow styler bugs
     st.dataframe(
-        df_weights.style.map(highlight_delta, subset=["Delta"]),
+        df_weights,
         use_container_width=True,
     )
 
