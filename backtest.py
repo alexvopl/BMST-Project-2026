@@ -299,7 +299,7 @@ def fetch_sentiment_history():
             print(f"Error fetching sentiment for {ticker}: {e}")
     return article_sentiments_history
 
-def run_backtest():
+def run_backtest(style="moderate"):
     start_time = time.time()
     
     # 1. Load Data
@@ -368,7 +368,7 @@ def run_backtest():
             print("  Running One-Shot optimization...")
             pareto_df_oneshot = run_nsga2(exp_ret_vec, cov_matrix, pop_size=50, n_gen=50)
             if len(pareto_df_oneshot) > 0:
-                opt_row_oneshot = pareto_df_oneshot.iloc[len(pareto_df_oneshot) // 2] # Moderate
+                opt_row_oneshot = pareto_df_oneshot.iloc[0] if style=="conservative" else pareto_df_oneshot.iloc[-1] if style=="aggressive" else pareto_df_oneshot.iloc[len(pareto_df_oneshot) // 2]
                 w_oneshot = np.array([opt_row_oneshot[f"w_{t}"] for t in TICKERS])
             else:
                 w_oneshot = w_passive
@@ -376,7 +376,7 @@ def run_backtest():
         # NSGA-Twin runs every day
         pareto_df_twin = run_nsga2(exp_ret_vec, cov_matrix, pop_size=50, n_gen=50)
         if len(pareto_df_twin) > 0:
-            opt_row_twin = pareto_df_twin.iloc[len(pareto_df_twin) // 2] # Moderate
+            opt_row_twin = pareto_df_twin.iloc[0] if style=="conservative" else pareto_df_twin.iloc[-1] if style=="aggressive" else pareto_df_twin.iloc[len(pareto_df_twin) // 2]
             w_twin = np.array([opt_row_twin[f"w_{t}"] for t in TICKERS])
         else:
             w_twin = w_passive
@@ -410,7 +410,7 @@ def run_backtest():
     plt.legend()
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    plt.savefig("cumulative_performance.png", dpi=150)
+    plt.savefig(f"{style}_cumulative_performance.png", dpi=150)
     plt.close()
     
     print("Saved cumulative_performance.png")
@@ -425,7 +425,7 @@ def run_backtest():
     plt.legend(loc="upper left")
     plt.margins(x=0, y=0)
     plt.tight_layout()
-    plt.savefig("weights_evolution.png", dpi=150)
+    plt.savefig(f"{style}_weights_evolution.png", dpi=150)
     plt.close()
     
     print("Saved weights_evolution.png")
@@ -471,7 +471,7 @@ def run_backtest():
                     
     fig.suptitle("Random Forest: Predicted vs Actual Returns", fontsize=16)
     plt.tight_layout()
-    plt.savefig("rf_accuracy.png", dpi=150)
+    plt.savefig(f"{style}_rf_accuracy.png", dpi=150)
     plt.close()
     
     print("Saved rf_accuracy.png")
@@ -518,11 +518,14 @@ def run_backtest():
     table.auto_set_font_size(False)
     table.set_fontsize(12)
     table.scale(1.2, 1.5)
-    plt.savefig("metrics_summary.png", dpi=150, bbox_inches="tight")
+    plt.savefig(f"{style}_metrics_summary.png", dpi=150, bbox_inches="tight")
     plt.close()
     print("Saved metrics_summary.png")
     
     print(f"\nTotal execution time: {time.time() - start_time:.2f} seconds")
 
 if __name__ == "__main__":
-    run_backtest()
+    print("Running CONSERVATIVE")
+    run_backtest("conservative")
+    print("Running AGGRESSIVE")
+    run_backtest("aggressive")
