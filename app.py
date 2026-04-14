@@ -527,7 +527,7 @@ with st.sidebar:
     )
 
     st.markdown("---")
-    st.subheader("NSGA-II Control (remettre en auto + tard)")
+    st.subheader("NSGA-II Control")
 
     # Show when the optimiser last ran
     last_run = st.session_state["last_nsga2_run"]
